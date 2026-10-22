@@ -105,6 +105,9 @@ export function detectFromHeaders(headers: Headers): Signal[] {
     }
   }
 
+  if (h("cf-mitigated") === "challenge") {
+    out.push({ id: "info:cf-challenge", strength: "info", source: "header", detail: "Cloudflare challenge page instead of the site" });
+  }
   if (h("cf-ray")) {
     out.push({ id: "info:cloudflare", strength: "info", source: "header", detail: "Fronted by Cloudflare" });
   }
@@ -150,6 +153,8 @@ const BODY_RULES: Array<[RegExp, string, Strength, string]> = [
   [/website-files\.com|webflow\.com\/css/i, "platform:webflow", "info", "Webflow asset host"],
   [/img1\.wsimg\.com/i, "platform:godaddy-builder", "info", "GoDaddy Website Builder asset host"],
   [/editmysite\.com/i, "platform:weebly", "info", "Weebly/Square Online asset host"],
+  // Tribute Technology sites have no CNAME (an A record on AWS), only these links.
+  [/efuneral\.com|tributetech/i, "platform:tribute", "info", "Tribute Technology (funeral home) links"],
 ];
 
 function generatorValues(html: string): string[] {
@@ -260,6 +265,13 @@ const DNS_RULES: Array<{ re: RegExp; label: string; signals: Array<[string, Stre
   { re: /(?:^|\.)vercel-dns\.com$/, label: "Vercel", signals: [["platform:vercel", "info"]] },
   { re: /(?:^|\.)netlify\.(?:app|com)$/, label: "Netlify", signals: [["platform:netlify", "info"]] },
   { re: /(?:^|\.)github\.io$/, label: "GitHub Pages", signals: [["platform:github-pages", "info"]] },
+  { re: /(?:^|\.)getbento\.com$/, label: "BentoBox", signals: [["platform:bentobox", "info"]] },
+  { re: /(?:^|\.)thryv\.com$/, label: "Thryv", signals: [["platform:thryv", "info"]] },
+  { re: /(?:^|\.)eflorist\.com$/, label: "eFlorist", signals: [["platform:eflorist", "info"]] },
+  { re: /(?:^|\.)sandhillshosted\.com$/, label: "Sandhills", signals: [["platform:sandhills", "info"]] },
+  { re: /(?:^|\.)ecatholic\.com$/, label: "eCatholic", signals: [["platform:ecatholic", "info"]] },
+  { re: /^advisors\.broadridge\.com$/, label: "Broadridge Advisor", signals: [["platform:broadridge", "info"]] },
+  { re: /(?:^|\.)marketpath\.site$/, label: "Marketpath", signals: [["platform:marketpath", "info"]] },
   { re: /(?:^|\.)hugedomains\.com$/, label: "HugeDomains for-sale page", signals: [["platform:parked", "info"]] },
   // Managed PHP hosts: PHP, but the host maintains it.
   { re: /(?:^|\.)(?:wpengine\.com|wpenginepowered\.com)$/, label: "WP Engine", signals: [["cms:wordpress", "suggests"], ["info:managed-php-host", "info"]] },
@@ -340,6 +352,10 @@ export function summarize(reachable: boolean, signals: Signal[], loginStatus: nu
   const verdict = (v: Verdict): Summary => ({ verdict: v, cms, platform, phpVersion, notes });
 
   if (!reachable) return verdict("unreachable");
+
+  if (signals.some((s) => s.id === "info:cf-challenge")) {
+    notes.push("A Cloudflare challenge answered instead of the site, so page and header checks saw nothing; DNS is the only evidence.");
+  }
 
   for (const s of signals) {
     if (s.id === "info:managed-php-host") notes.push(`Managed PHP host per DNS (${s.detail}); the host maintains PHP.`);

@@ -110,6 +110,13 @@ describe("domain input", () => {
   });
 });
 
+describe("tribute", () => {
+  it("recognizes Tribute Technology funeral home sites by their links", () => {
+    const s = detectFromBody('<a href="https://www.efuneral.com/obituaries">Obituaries</a>', "https://funeralhome.example/");
+    expect(s.map((x) => x.id)).toContain("platform:tribute");
+  });
+});
+
 describe("login probe redirects", () => {
   it("ignores wp-login.php in a redirect's query string", () => {
     expect(detectFromLoginProbe(302, "https://www.example.org/search.php?pattern=wp-login.php", "")).toEqual([]);
@@ -125,6 +132,30 @@ describe("dns", () => {
     const s = detectFromDns([{ name: "www.client.com", targets: ["client.com.edgekey.net", "cdn1.wixdns.net"] }], "client.com");
     expect(s.map((x) => x.id)).toEqual(["info:cname", "platform:wix"]);
     expect(s[0].detail).toBe("www.client.com → client.com.edgekey.net → cdn1.wixdns.net");
+  });
+  it("names the hosted vendors seen in live DNS", () => {
+    const cases: Array<[string[], string]> = [
+      [["fast.getbento.com"], "bentobox"],
+      [["s.website.thryv.com", "s.partnerwebsitedns.com", "global.partnerwebsitedns.com"], "thryv"],
+      [["oc.eflorist.com", "eflorist-oc.ecommerce.eflorist.com"], "eflorist"],
+      [["sites.sandhillshosted.com"], "sandhills"],
+      [["cf.sites.ecatholic.com"], "ecatholic"],
+      [["advisors.broadridge.com", "advisors.broadridge.com.cdn.cloudflare.net"], "broadridge"],
+      [["live01.instance.marketpath.site"], "marketpath"],
+    ];
+    for (const [targets, platform] of cases) {
+      const s = detectFromDns([{ name: "www.client.com", targets }], "client.com");
+      expect(s.find((x) => x.id.startsWith("platform:"))?.id, targets[0]).toBe(`platform:${platform}`);
+    }
+  });
+  it("calls a challenged site hosted when DNS names the platform, with a note", () => {
+    const signals = [
+      ...detectFromDns([{ name: "www.client.com", targets: ["sites.sandhillshosted.com"] }], "client.com"),
+      ...detectFromHeaders(hdrs([["cf-mitigated", "challenge"], ["cf-ray", "x"]])),
+    ];
+    const r = summarize(true, signals, 403);
+    expect(r.verdict).toBe("hosted-platform");
+    expect(r.notes.join(" ")).toMatch(/Cloudflare challenge/);
   });
   it("reports an unknown vendor's CNAME without inventing a platform", () => {
     const s = detectFromDns([{ name: "www.client.com", targets: ["sites.somevendor.com"] }], "client.com");
