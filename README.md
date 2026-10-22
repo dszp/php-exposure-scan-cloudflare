@@ -2,26 +2,32 @@
 
 A Cloudflare Worker that takes a list of domains and reports which ones show signs of running PHP, with WordPress detected specifically. It was built during the October 2026 PHP core RCE response (CVE-2026-109618 / CVE-2026-109619) so client notifications could go to the sites that actually need them.
 
-It is a triage tool, not a vulnerability scanner. It doesn't test for the vulnerability or send exploit payloads, and it requests only the homepage and `/wp-login.php`.
+It is a triage tool, not a vulnerability scanner. It doesn't test for the vulnerability or send exploit payloads, and it never submits a form. Each site gets two DNS lookups and a few GET requests, listed below.
 
 ## What each site gets
 
-1. `GET https://host/`, following redirects. If that attempt fails to connect, the scan tries `https://www.host/` and then `http://host/`.
-2. `GET /wp-login.php` on the final origin, without following redirects.
+The scan always checks both the apex and `www`, whichever one you enter. `www.example.com` and `example.com` in the same list are one entry.
 
-That's two requests per reachable site, plus any redirect hops. Requests carry the `USER_AGENT` from `wrangler.jsonc`. Set it to identify you and give a contact URL, so site owners who see the requests in their logs know who sent them.
+1. **DNS.** The CNAME chains for `example.com` and `www.example.com`, looked up over DNS over HTTPS at `cloudflare-dns.com`. A chain that leaves the domain is reported in the `dns_cname` column, and a target from a known host (Squarespace, Wix, Webflow, Duda, HubSpot, Shopify, WP Engine, and others in `src/detect.ts`) names the platform. Builders that render generic HTML show up here when the page markup gives nothing away.
+2. **Homepages.** `GET https://example.com/`, following redirects, then `http://` if https fails to connect. Then the same for `www.example.com`, unless the apex already redirected there. If the two names end up on different sites, both sites are checked and the result says so.
+3. **`GET /wp-login.php`** on each site, without following redirects.
+4. **One `.php` request** on each site, sent only when PHP isn't confirmed yet and no hosted platform was found. The scan picks a `.php` link or form action from the homepage, skipping logout, delete and similar paths, and sends a plain GET without the query string. It falls back to `/index.php` when the homepage has no such link. A homepage served from a page cache often lacks the PHP headers that a request reaching PHP itself returns, which is how this step finds the PHP version.
+
+That's two DNS lookups and two to six requests per site, plus any redirect hops. Requests carry the `USER_AGENT` from `wrangler.jsonc`. Set it to identify you and give a contact URL, so site owners who see the requests in their logs know who sent them.
 
 ## Verdicts
 
 | Verdict | Meaning |
 | --- | --- |
-| `php-confirmed` | A response proved PHP: `X-Powered-By: PHP`, PHP in `Server`, a `PHPSESSID` or PHP-framework cookie, a WordPress-only header (`X-Pingback`, REST `Link`), or `wp-login.php` serving the real login form. |
+| `php-confirmed` | A response proved PHP: `X-Powered-By: PHP`, PHP in `Server`, a `PHPSESSID` or PHP-framework cookie, a WordPress-only header (`X-Pingback`, REST `Link`), or `wp-login.php` serving the real login form. The `php_version` column shows the lowest version any response reported. |
 | `php-likely` | Markup from a PHP CMS (WordPress, Drupal, Joomla, Magento, and others) or same-site links to `.php` files, without a header or cookie that proves it. A WordPress static export lands here, with a note. |
-| `hosted-platform` | A builder that doesn't expose customer-managed PHP (Squarespace, Wix, Shopify, Webflow, GoDaddy Builder, Weebly, Vercel, Netlify, GitHub Pages). |
+| `hosted-platform` | A builder that doesn't expose customer-managed PHP (Squarespace, Wix, Shopify, Webflow, Duda, HubSpot, GoDaddy Builder, Weebly, Vercel, Netlify, GitHub Pages). A CNAME to a known platform outranks page markup that only suggests PHP. |
 | `no-php-signals` | Reachable, but nothing was found. This isn't proof: headers can be stripped, and some WAFs block scanners. |
 | `unreachable` | Every attempt failed to connect. The errors are in the result. |
 
-WordPress.com and managed WordPress hosts still show as PHP. They do run PHP, but the host patches it, so read each verdict alongside where the site is hosted.
+WordPress.com and managed WordPress hosts still show as PHP. They do run PHP, but the host patches it, so read each verdict alongside where the site is hosted. A CNAME to WP Engine or Pantheon adds a note saying so.
+
+The DNS rules only name hosts whose CNAME targets were checked. A vendor without a rule still shows its CNAME target in `dns_cname`, so scan that column for vendor names; to add a rule, add an entry to `DNS_RULES` in `src/detect.ts`.
 
 ## Security model
 
@@ -34,7 +40,7 @@ WordPress.com and managed WordPress hosts still show as PHP. They do run PHP, bu
 
 ## Requirements
 
-- A Cloudflare account on the Workers Paid plan. Free-plan Workers are capped at 50 external subrequests per invocation, which covers about 15 sites.
+- A Cloudflare account on the Workers Paid plan. Free-plan Workers are capped at 50 external subrequests per invocation, which covers about five sites.
 - A domain on Cloudflare for the scanner's hostname.
 - Cloudflare Zero Trust (the free tier is enough) for the Access application.
 - Node.js 22.12 or later.
@@ -104,23 +110,23 @@ The default response is NDJSON streamed per host: a `start` line, one `result` l
 
 ## Run locally
 
-`wrangler dev` runs the full pipeline on your machine. To skip the Access check for requests to `localhost`, copy `.dev.vars.example` to `.dev.vars`:
+`npm run dev` runs the full pipeline on your machine with `wrangler dev`. To skip the Access check for requests to `localhost`, copy `.dev.vars.example` to `.dev.vars`:
 
 ```sh
 cp .dev.vars.example .dev.vars
 npm run dev
 ```
 
-The setting in `.dev.vars` takes effect only for `localhost` requests. Don't add it to `wrangler.jsonc`.
+The setting in `.dev.vars` takes effect only for `localhost` requests. Don't add it to `wrangler.jsonc`. The `dev` script passes `--local-upstream localhost`, because otherwise `wrangler dev` rewrites each request's host to the route in `wrangler.jsonc` and the check never sees `localhost`.
 
 ## Limits
 
-- Paid Workers default to 10,000 subrequests per invocation. `wrangler.jsonc` raises this Worker's limit to 20,000, which covers 500 hosts in redirect-heavy worst cases.
+- Paid Workers default to 10,000 subrequests per invocation. `wrangler.jsonc` raises this Worker's limit to 20,000. That allows 40 per host at 500 hosts, against a worst case of about 10 plus redirect hops.
 - A Worker can have at most six requests waiting on response headers at once, so `CONCURRENCY` defaults to 6. With 15-second timeouts, a 500-host run takes a few minutes.
 
 ## Tests
 
-`npm test` covers the detection rules, verdict logic, domain normalization, CSV escaping, and the per-host scan flow against a stubbed `fetch`. The test suite doesn't make live requests.
+`npm test` covers the detection and DNS rules, verdict logic, domain normalization, CSV escaping, and the per-host scan flow against a stubbed `fetch`. The test suite doesn't make live requests.
 
 ## License
 

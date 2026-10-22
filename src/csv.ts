@@ -11,14 +11,14 @@ export function csvCell(value: unknown): string {
 }
 
 export const CSV_COLUMNS = [
-  "input", "host", "verdict", "cms", "platform", "final_url", "status", "server",
-  "x_powered_by", "cloudflare", "login_status", "signals", "notes", "errors", "duration_ms",
+  "input", "host", "verdict", "php_version", "cms", "platform", "final_url", "status", "server",
+  "x_powered_by", "cloudflare", "login_status", "dns_cname", "signals", "notes", "errors", "duration_ms",
 ] as const;
 
 export function csvRow(r: ScanResult): string {
   return [
-    r.input, r.host, r.verdict, r.cms, r.platform, r.finalUrl, r.status, r.server,
-    r.poweredBy, r.cloudflare, r.loginStatus,
+    r.input, r.host, r.verdict, r.phpVersion, r.cms, r.platform, r.finalUrl, r.status, r.server,
+    r.poweredBy, r.cloudflare, r.loginStatus, r.dns.join(" | "),
     r.signals.map((s) => `${s.id}(${s.strength})`).join("; "),
     r.notes.join(" | "), r.errors.join(" | "), r.durationMs,
   ].map(csvCell).join(",");

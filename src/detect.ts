@@ -8,7 +8,7 @@ export type Strength = "confirms" | "suggests" | "info";
 export interface Signal {
   id: string; // "php:...", "cms:<name>", "platform:<name>", or "info:..."
   strength: Strength;
-  source: "header" | "cookie" | "body" | "probe";
+  source: "header" | "cookie" | "body" | "probe" | "dns";
   detail: string;
 }
 
@@ -219,10 +219,74 @@ export function detectFromLoginProbe(status: number, location: string | null, bo
   if (status === 401) {
     return [{ id: "info:login-auth", strength: "info", source: "probe", detail: "wp-login.php returns 401 (HTTP auth in front of it)" }];
   }
-  if (status >= 300 && status < 400 && location && /wp-login|wp-admin/i.test(location)) {
+  // Only the redirect's path counts: a site search for the missing page can
+  // carry "wp-login.php" in its query string.
+  const path = location ? (() => { try { return new URL(location, "https://x/").pathname; } catch { return ""; } })() : "";
+  if (status >= 300 && status < 400 && /wp-login|wp-admin/i.test(path)) {
     return [{ id: "cms:wordpress", strength: "suggests", source: "probe", detail: clip(`wp-login.php redirects to ${location}`) }];
   }
   return [];
+}
+
+// ---------- follow-up .php probe ----------
+
+// Paths a GET could change state on, or that WordPress handles specially.
+const UNSAFE_PROBE = /log-?out|log-?off|sign-?out|delete|remove|unsubscribe|cancel|destroy|reset|wp-login\.php$|wp-cron\.php$|xmlrpc\.php$|admin-ajax\.php$|wp-comments-post\.php$/i;
+
+// A homepage served from a page cache often lacks the PHP headers that any
+// request reaching PHP itself carries. Picks one same-site .php path to GET
+// (never a form submission, and without the query string), else /index.php.
+export function phpProbePath(links: string[]): string {
+  return links.find((p) => !UNSAFE_PROBE.test(p)) ?? "/index.php";
+}
+
+// ---------- DNS ----------
+
+export interface CnameChain {
+  name: string;
+  targets: string[]; // CNAME targets in resolution order
+}
+
+// CNAME targets that identify where a site is hosted. Page markup misses
+// builders that render generic HTML; the DNS target doesn't.
+const DNS_RULES: Array<{ re: RegExp; label: string; signals: Array<[string, Strength]> }> = [
+  { re: /(?:^|\.)squarespace\.com$/, label: "Squarespace", signals: [["platform:squarespace", "info"]] },
+  { re: /(?:^|\.)wixdns\.net$/, label: "Wix", signals: [["platform:wix", "info"]] },
+  { re: /(?:^|\.)webflow\.com$/, label: "Webflow", signals: [["platform:webflow", "info"]] },
+  { re: /(?:^|\.)multiscreensite\.com$/, label: "Duda", signals: [["platform:duda", "info"]] },
+  { re: /(?:^|\.)(?:hubspot\.net|hscoscdn\d*\.net)$/, label: "HubSpot CMS", signals: [["platform:hubspot", "info"]] },
+  { re: /(?:^|\.)myshopify\.com$/, label: "Shopify", signals: [["platform:shopify", "info"]] },
+  { re: /(?:^|\.)azurestaticapps\.net$/, label: "Azure Static Web Apps", signals: [["platform:azure-static-web-apps", "info"]] },
+  { re: /(?:^|\.)vercel-dns\.com$/, label: "Vercel", signals: [["platform:vercel", "info"]] },
+  { re: /(?:^|\.)netlify\.(?:app|com)$/, label: "Netlify", signals: [["platform:netlify", "info"]] },
+  { re: /(?:^|\.)github\.io$/, label: "GitHub Pages", signals: [["platform:github-pages", "info"]] },
+  { re: /(?:^|\.)hugedomains\.com$/, label: "HugeDomains for-sale page", signals: [["platform:parked", "info"]] },
+  // Managed PHP hosts: PHP, but the host maintains it.
+  { re: /(?:^|\.)(?:wpengine\.com|wpenginepowered\.com)$/, label: "WP Engine", signals: [["cms:wordpress", "suggests"], ["info:managed-php-host", "info"]] },
+  { re: /(?:^|\.)pantheonsite\.io$/, label: "Pantheon", signals: [["php:managed-host", "suggests"], ["info:managed-php-host", "info"]] },
+  // Can run PHP; the target alone says nothing more.
+  { re: /\.azurewebsites\.(?:net|windows\.net)$/, label: "Azure App Service", signals: [["info:azure-app-service", "info"]] },
+];
+
+// `base` is the scanned domain; CNAMEs that stay inside it (www → apex) are not
+// hosting evidence. Every chain that leaves it is reported, matched or not, so
+// a reader can spot a vendor the rules don't know.
+export function detectFromDns(chains: CnameChain[], base: string): Signal[] {
+  const own = (h: string) => h === base || h.endsWith(`.${base}`);
+  const out: Signal[] = [];
+  for (const { name, targets } of chains) {
+    if (!targets.some((t) => !own(t))) continue;
+    out.push({ id: "info:cname", strength: "info", source: "dns", detail: clip(`${name} → ${targets.join(" → ")}`) });
+    for (const t of targets) {
+      const rule = DNS_RULES.find((r) => r.re.test(t));
+      if (!rule) continue;
+      for (const [id, strength] of rule.signals) {
+        out.push({ id, strength, source: "dns", detail: clip(`${name} → ${t} (${rule.label})`) });
+      }
+      break;
+    }
+  }
+  return out;
 }
 
 // ---------- verdict ----------
@@ -238,7 +302,18 @@ export interface Summary {
   verdict: Verdict;
   cms: string | null;
   platform: string | null;
+  phpVersion: string | null;
   notes: string[];
+}
+
+// Lowest PHP version any response admitted to, since the oldest one is the
+// one that needs attention.
+export function phpVersionOf(signals: Signal[]): string | null {
+  const versions = signals
+    .filter((s) => s.id === "php:x-powered-by" || s.id === "php:server-header")
+    .map((s) => /PHP\/(\d+(?:\.\d+){0,2})/i.exec(s.detail)?.[1])
+    .filter((v): v is string => !!v);
+  return versions.sort((a, b) => a.localeCompare(b, "en", { numeric: true }))[0] ?? null;
 }
 
 export function dedupeSignals(signals: Signal[]): Signal[] {
@@ -258,16 +333,32 @@ export function summarize(reachable: boolean, signals: Signal[], loginStatus: nu
   const cms = cmsSignals.length
     ? [...cmsSignals].sort((a, b) => rank[a.strength] - rank[b.strength])[0].id.slice(4)
     : null;
-  const platform = signals.find((s) => s.id.startsWith("platform:"))?.id.slice(9) ?? null;
+  // A CNAME to a hosting platform outranks what the page markup implies.
+  const dnsPlatform = signals.find((s) => s.source === "dns" && s.id.startsWith("platform:"));
+  const platform = (dnsPlatform ?? signals.find((s) => s.id.startsWith("platform:")))?.id.slice(9) ?? null;
+  const phpVersion = phpVersionOf(signals);
+  const verdict = (v: Verdict): Summary => ({ verdict: v, cms, platform, phpVersion, notes });
 
-  if (!reachable) return { verdict: "unreachable", cms, platform, notes };
+  if (!reachable) return verdict("unreachable");
+
+  for (const s of signals) {
+    if (s.id === "info:managed-php-host") notes.push(`Managed PHP host per DNS (${s.detail}); the host maintains PHP.`);
+  }
 
   // A non-PHP CMS name can't confirm PHP, but every cms:* id here is a PHP one.
   const phpish = (s: Signal) => s.id.startsWith("php:") || (s.id.startsWith("cms:") && isPhpCms(s.id.slice(4)));
   const confirmed = signals.some((s) => phpish(s) && s.strength === "confirms");
   const suggested = signals.some((s) => phpish(s) && s.strength === "suggests");
 
-  if (confirmed) return { verdict: "php-confirmed", cms, platform, notes };
+  if (confirmed) {
+    if (dnsPlatform) notes.push(`DNS points at a hosted platform (${dnsPlatform.detail}), so the vendor likely runs this PHP.`);
+    return verdict("php-confirmed");
+  }
+
+  if (dnsPlatform) {
+    if (suggested) notes.push(`Page markup suggests PHP, but DNS points at a hosted platform (${dnsPlatform.detail}).`);
+    return verdict("hosted-platform");
+  }
 
   if (suggested) {
     if (cms === "wordpress" && !signals.some((s) => s.source !== "body" && s.id === "cms:wordpress")) {
@@ -277,12 +368,10 @@ export function summarize(reachable: boolean, signals: Signal[], loginStatus: nu
           : "WordPress markers in the HTML only; no PHP header or cookie seen.",
       );
     }
-    return { verdict: "php-likely", cms, platform, notes };
+    return verdict("php-likely");
   }
 
-  if (platform && platform !== "static-site-generator") {
-    return { verdict: "hosted-platform", cms, platform, notes };
-  }
+  if (platform && platform !== "static-site-generator") return verdict("hosted-platform");
   notes.push("No PHP signals found. Absence is not proof: headers can be suppressed and some sites block scanners.");
-  return { verdict: "no-php-signals", cms, platform, notes };
+  return verdict("no-php-signals");
 }

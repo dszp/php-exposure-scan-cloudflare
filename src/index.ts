@@ -74,8 +74,8 @@ async function handleScan(request: Request, env: Env, ctx: ExecutionContext, who
       return await scanHost(host, host, opt);
     } catch (e) {
       return {
-        input: host, host, verdict: "unreachable", cms: null, platform: null, finalUrl: null, status: null,
-        server: null, poweredBy: null, cloudflare: false, loginStatus: null, signals: [], notes: [],
+        input: host, host, verdict: "unreachable", cms: null, platform: null, phpVersion: null, finalUrl: null,
+        status: null, server: null, poweredBy: null, cloudflare: false, loginStatus: null, dns: [], signals: [], notes: [],
         errors: [`scanner error → ${e instanceof Error ? e.message : String(e)}`.slice(0, 200)], durationMs: 0,
       };
     }

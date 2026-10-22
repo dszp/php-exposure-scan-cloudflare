@@ -1,6 +1,7 @@
 import {
-  type Signal, type Verdict,
-  dedupeSignals, detectFromBody, detectFromHeaders, detectFromLoginProbe, summarize,
+  type CnameChain, type Signal, type Verdict,
+  dedupeSignals, detectFromBody, detectFromDns, detectFromHeaders, detectFromLoginProbe,
+  isPhpCms, phpProbePath, samesitePhpLinks, summarize,
 } from "./detect";
 
 export interface ScanOptions {
@@ -15,12 +16,14 @@ export interface ScanResult {
   verdict: Verdict;
   cms: string | null;
   platform: string | null;
+  phpVersion: string | null;
   finalUrl: string | null;
   status: number | null;
   server: string | null;
   poweredBy: string | null;
   cloudflare: boolean;
   loginStatus: number | null;
+  dns: string[];
   signals: Signal[];
   notes: string[];
   errors: string[];
@@ -59,71 +62,160 @@ export async function readLimited(res: Response, max: number): Promise<string> {
   return new TextDecoder().decode(buf);
 }
 
-function candidates(host: string): string[] {
-  const list = [`https://${host}/`];
-  if (!host.startsWith("www.")) list.push(`https://www.${host}/`);
-  list.push(`http://${host}/`);
-  return list;
+const DOH = "https://cloudflare-dns.com/dns-query";
+
+// CNAME chain for one name via DNS over HTTPS (Workers have no resolver API).
+// An A query returns the whole chain, CNAMEs first, in resolution order.
+export async function cnameChain(name: string, opt: ScanOptions): Promise<string[]> {
+  const res = await fetch(`${DOH}?name=${encodeURIComponent(name)}&type=A`, {
+    headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(opt.timeoutMs),
+  });
+  if (!res.ok) throw new Error(`DoH HTTP ${res.status}`);
+  const body = (await res.json()) as { Answer?: Array<{ type: number; data: string }> };
+  return (body.Answer ?? [])
+    .filter((a) => a.type === 5)
+    .map((a) => a.data.toLowerCase().replace(/\.$/, ""))
+    .slice(0, 10);
 }
+
+interface Homepage {
+  res: Response;
+  finalUrl: string;
+}
+
+// https first; plain http only when https fails to connect.
+async function fetchHomepage(name: string, headers: Record<string, string>, opt: ScanOptions, errors: string[]): Promise<Homepage | null> {
+  for (const url of [`https://${name}/`, `http://${name}/`]) {
+    try {
+      const res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(opt.timeoutMs) });
+      return { res, finalUrl: res.url || url };
+    } catch (e) {
+      errors.push(`${url} → ${errText(e)}`);
+    }
+  }
+  return null;
+}
+
+async function readHomepage(page: Homepage, opt: ScanOptions, errors: string[]): Promise<{ signals: Signal[]; phpLinks: string[] }> {
+  const signals = detectFromHeaders(page.res.headers);
+  const ctype = page.res.headers.get("content-type") ?? "";
+  let phpLinks: string[] = [];
+  if (/html|xml|text\/plain/i.test(ctype) || !ctype) {
+    try {
+      const html = await readLimited(page.res, opt.maxBodyBytes);
+      signals.push(...detectFromBody(html, page.finalUrl));
+      phpLinks = samesitePhpLinks(html, page.finalUrl);
+    } catch (e) {
+      errors.push(`body read → ${errText(e)}`);
+    }
+  } else {
+    page.res.body?.cancel().catch(() => {});
+  }
+  return { signals, phpLinks };
+}
+
+// Header-only GET of one path on an origin; returns the PHP headers it proved.
+async function probe(url: string, headers: Record<string, string>, opt: ScanOptions): Promise<{ status: number; res: Response; signals: Signal[] }> {
+  const res = await fetch(url, { headers, redirect: "manual", signal: AbortSignal.timeout(opt.timeoutMs) });
+  const path = new URL(url).pathname;
+  const signals = detectFromHeaders(res.headers)
+    .filter((s) => s.strength === "confirms")
+    .map((s) => ({ ...s, source: "probe" as const, detail: `${s.detail} (on ${path})` }));
+  return { status: res.status, res, signals };
+}
+
+const phpConfirmed = (signals: Signal[]) =>
+  signals.some((s) => s.strength === "confirms" && (s.id.startsWith("php:") || (s.id.startsWith("cms:") && isPhpCms(s.id.slice(4)))));
 
 export async function scanHost(host: string, input: string, opt: ScanOptions): Promise<ScanResult> {
   const started = Date.now();
   const headers = { "user-agent": opt.userAgent, accept: "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8" };
   const errors: string[] = [];
-  let res: Response | null = null;
+  const signals: Signal[] = [];
+  // Apex and www are always both checked: they can be hosted in different places.
+  const base = host.replace(/^www\./, "");
+  const names = [base, `www.${base}`];
 
-  for (const url of candidates(host)) {
+  // Requests run one after another: Workers allow six connections waiting on
+  // headers, and runPool already keeps that many hosts in flight.
+  const chains: CnameChain[] = [];
+  for (const name of names) {
     try {
-      res = await fetch(url, { headers, redirect: "follow", signal: AbortSignal.timeout(opt.timeoutMs) });
-      break;
+      chains.push({ name, targets: await cnameChain(name, opt) });
     } catch (e) {
-      errors.push(`${url} → ${errText(e)}`);
+      errors.push(`DNS ${name} → ${errText(e)}`);
     }
   }
+  signals.push(...detectFromDns(chains, base));
+  const dns = chains.filter((c) => c.targets.length).map((c) => `${c.name} → ${c.targets.join(" → ")}`);
 
-  if (!res) {
-    const s = summarize(false, [], null);
+  // Fetch www separately unless the apex already landed there.
+  const pages: Homepage[] = [];
+  const apex = await fetchHomepage(base, headers, opt, errors);
+  if (apex) pages.push(apex);
+  if (!apex || new URL(apex.finalUrl).hostname !== names[1]) {
+    const www = await fetchHomepage(names[1], headers, opt, errors);
+    if (www) pages.push(www);
+  }
+
+  if (!pages.length) {
+    const s = summarize(false, signals, null);
     return {
-      input, host, ...s, finalUrl: null, status: null, server: null, poweredBy: null,
-      cloudflare: false, loginStatus: null, signals: [], errors, durationMs: Date.now() - started,
+      input, host: base, ...s, finalUrl: null, status: null, server: null, poweredBy: null,
+      cloudflare: false, loginStatus: null, dns, signals: dedupeSignals(signals), errors, durationMs: Date.now() - started,
     };
   }
 
-  const finalUrl = res.url || `https://${host}/`;
-  const signals: Signal[] = detectFromHeaders(res.headers);
-  const ctype = res.headers.get("content-type") ?? "";
-  if (/html|xml|text\/plain/i.test(ctype) || !ctype) {
-    try {
-      signals.push(...detectFromBody(await readLimited(res, opt.maxBodyBytes), finalUrl));
-    } catch (e) {
-      errors.push(`body read → ${errText(e)}`);
-    }
-  } else {
-    res.body?.cancel().catch(() => {});
+  // One analysis per distinct site the two names end up on.
+  const origins = new Map<string, Homepage>();
+  for (const p of pages) {
+    const key = new URL(p.finalUrl).hostname;
+    if (origins.has(key)) p.res.body?.cancel().catch(() => {});
+    else origins.set(key, p);
+  }
+  if (origins.size > 1) {
+    const notes = [...origins.values()].map((p) => p.finalUrl).join(" and ");
+    signals.push({ id: "info:split-site", strength: "info", source: "probe", detail: `Apex and www serve different sites: ${notes}`.slice(0, 160) });
   }
 
-  // One extra request: WordPress is the bulk of what matters here, and the
-  // login page answers the question even when the homepage hides it.
   let loginStatus: number | null = null;
-  try {
-    const login = await fetch(new URL("/wp-login.php", finalUrl).toString(), {
-      headers, redirect: "manual", signal: AbortSignal.timeout(opt.timeoutMs),
-    });
-    loginStatus = login.status;
-    const body = login.status === 200 ? await readLimited(login, 64 * 1024) : "";
-    if (login.status !== 200) login.body?.cancel().catch(() => {});
-    signals.push(...detectFromLoginProbe(login.status, login.headers.get("location"), body));
-    signals.push(...detectFromHeaders(login.headers).filter((s) => s.strength === "confirms"));
-  } catch (e) {
-    errors.push(`wp-login.php probe → ${errText(e)}`);
+  for (const page of origins.values()) {
+    const home = await readHomepage(page, opt, errors);
+    signals.push(...home.signals);
+
+    // WordPress is the bulk of what matters here, and the login page answers
+    // the question even when the homepage hides it.
+    try {
+      const login = await probe(new URL("/wp-login.php", page.finalUrl).toString(), headers, opt);
+      loginStatus ??= login.status;
+      const body = login.status === 200 ? await readLimited(login.res, 64 * 1024) : "";
+      if (login.status !== 200) login.res.body?.cancel().catch(() => {});
+      signals.push(...detectFromLoginProbe(login.status, login.res.headers.get("location"), body), ...login.signals);
+    } catch (e) {
+      errors.push(`wp-login.php probe → ${errText(e)}`);
+    }
+
+    // A cached homepage can hide PHP that any request reaching PHP reveals.
+    const pagePlatform = home.signals.some((s) => s.id.startsWith("platform:"));
+    if (!phpConfirmed(signals) && !pagePlatform && !signals.some((s) => s.source === "dns" && s.id.startsWith("platform:"))) {
+      const url = new URL(phpProbePath(home.phpLinks), page.finalUrl).toString();
+      try {
+        const r = await probe(url, headers, opt);
+        r.res.body?.cancel().catch(() => {});
+        signals.push(...r.signals);
+      } catch (e) {
+        errors.push(`${url} probe → ${errText(e)}`);
+      }
+    }
   }
 
+  const primary = pages[0];
   const unique = dedupeSignals(signals);
   const s = summarize(true, unique, loginStatus);
   return {
-    input, host, ...s, finalUrl, status: res.status,
-    server: res.headers.get("server"), poweredBy: res.headers.get("x-powered-by"),
-    cloudflare: res.headers.has("cf-ray"), loginStatus, signals: unique, errors,
+    input, host: base, ...s, finalUrl: primary.finalUrl, status: primary.res.status,
+    server: primary.res.headers.get("server"), poweredBy: primary.res.headers.get("x-powered-by"),
+    cloudflare: primary.res.headers.has("cf-ray"), loginStatus, dns, signals: unique, errors,
     durationMs: Date.now() - started,
   };
 }

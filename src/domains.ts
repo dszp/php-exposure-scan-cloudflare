@@ -32,7 +32,9 @@ export function normalizeHost(input: string): { host?: string; reason?: string }
   if (url.protocol !== "http:" && url.protocol !== "https:") return { reason: "unsupported scheme" };
   if (url.username || url.password) return { reason: "credentials in URL" };
 
-  const host = url.hostname.replace(/\.$/, ""); // URL() has already punycoded IDNs
+  // URL() has already punycoded IDNs. www is dropped because every scan checks
+  // both the apex and www, so the two spellings are one entry.
+  const host = url.hostname.replace(/\.$/, "").replace(/^www\./, "");
   if (host.startsWith("[") || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) return { reason: "IP addresses are not scanned" };
   if (!host.includes(".")) return { reason: "single-label name" };
   if (host === "localhost" || INTERNAL_SUFFIXES.some((x) => host.endsWith(x))) return { reason: "internal-only name" };

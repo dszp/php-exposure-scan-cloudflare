@@ -101,6 +101,7 @@ function renderRow(r) {
   const site = el("td", r.host);
   if (r.finalUrl) site.append(el("small", r.finalUrl));
   const verdict = el("td", LABEL[r.verdict] || r.verdict, "verdict v-" + r.verdict);
+  if (r.phpVersion) verdict.append(el("small", "PHP " + r.phpVersion));
   const kind = el("td", [r.cms, r.platform].filter(Boolean).join(" / ") || "—");
   if (r.status != null) kind.append(el("small", "HTTP " + r.status + (r.cloudflare ? " · Cloudflare" : "")));
   const ev = document.createElement("td");

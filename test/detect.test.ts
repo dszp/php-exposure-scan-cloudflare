@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { detectFromBody, detectFromHeaders, detectFromLoginProbe, samesitePhpLinks, summarize } from "../src/detect";
+import { detectFromBody, detectFromDns, detectFromHeaders, detectFromLoginProbe, phpProbePath, phpVersionOf, samesitePhpLinks, summarize } from "../src/detect";
 import { normalizeHost, normalizeList, splitList } from "../src/domains";
 import { csvCell } from "../src/csv";
 
@@ -90,7 +90,7 @@ describe("summarize", () => {
 
 describe("domain input", () => {
   it("normalizes URLs, emails, and wildcards", () => {
-    expect(normalizeHost("https://WWW.Example.com/path?q=1").host).toBe("www.example.com");
+    expect(normalizeHost("https://WWW.Example.com/path?q=1").host).toBe("example.com");
     expect(normalizeHost("jane.doe@ClientCo.org").host).toBe("clientco.org");
     expect(normalizeHost("*.example.net").host).toBe("example.net");
     expect(normalizeHost("example.com.").host).toBe("example.com");
@@ -107,6 +107,59 @@ describe("domain input", () => {
     expect(r.hosts).toEqual(["a.com", "b.com", "c.com"]);
     expect(r.rejected).toHaveLength(1);
     expect(r.overLimit).toBe(true);
+  });
+});
+
+describe("login probe redirects", () => {
+  it("ignores wp-login.php in a redirect's query string", () => {
+    expect(detectFromLoginProbe(302, "https://www.example.org/search.php?pattern=wp-login.php", "")).toEqual([]);
+    expect(detectFromLoginProbe(302, "/wp-admin/", "")[0]?.id).toBe("cms:wordpress");
+  });
+});
+
+describe("dns", () => {
+  it("ignores CNAMEs that stay inside the scanned domain", () => {
+    expect(detectFromDns([{ name: "www.client.com", targets: ["client.com"] }], "client.com")).toEqual([]);
+  });
+  it("names a known platform and records the chain", () => {
+    const s = detectFromDns([{ name: "www.client.com", targets: ["client.com.edgekey.net", "cdn1.wixdns.net"] }], "client.com");
+    expect(s.map((x) => x.id)).toEqual(["info:cname", "platform:wix"]);
+    expect(s[0].detail).toBe("www.client.com → client.com.edgekey.net → cdn1.wixdns.net");
+  });
+  it("reports an unknown vendor's CNAME without inventing a platform", () => {
+    const s = detectFromDns([{ name: "www.client.com", targets: ["sites.somevendor.com"] }], "client.com");
+    expect(s.map((x) => x.id)).toEqual(["info:cname"]);
+  });
+  it("treats a managed WordPress host as PHP the host maintains", () => {
+    const signals = detectFromDns([{ name: "www.client.com", targets: ["client.wpengine.com", "wp.wpenginepowered.com"] }], "client.com");
+    const r = summarize(true, signals, 404);
+    expect(r.verdict).toBe("php-likely");
+    expect(r.notes.join(" ")).toMatch(/Managed PHP host/);
+  });
+  it("keeps proven PHP confirmed on a hosted platform, with a note", () => {
+    const signals = [
+      ...detectFromDns([{ name: "www.client.com", targets: ["ext-sq.squarespace.com"] }], "client.com"),
+      ...detectFromHeaders(hdrs([["x-powered-by", "PHP/7.4.33"]])),
+    ];
+    const r = summarize(true, signals, 404);
+    expect(r.verdict).toBe("php-confirmed");
+    expect(r.phpVersion).toBe("7.4.33");
+    expect(r.notes.join(" ")).toMatch(/vendor likely runs/);
+  });
+});
+
+describe("php probe path", () => {
+  it("skips state-changing and special WordPress paths", () => {
+    expect(phpProbePath(["/logout.php", "/wp-cron.php", "/contact.php"])).toBe("/contact.php");
+    expect(phpProbePath(["/sign-out.php"])).toBe("/index.php");
+    expect(phpProbePath([])).toBe("/index.php");
+  });
+  it("reports the lowest PHP version seen", () => {
+    const signals = [
+      ...detectFromHeaders(hdrs([["x-powered-by", "PHP/8.2.10"]])),
+      ...detectFromHeaders(hdrs([["server", "Apache/2.4 PHP/7.4.33"]])),
+    ];
+    expect(phpVersionOf(signals)).toBe("7.4.33");
   });
 });
 
