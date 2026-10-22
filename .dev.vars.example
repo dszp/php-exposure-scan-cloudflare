@@ -1,0 +1,3 @@
+# Copy to .dev.vars for `npm run dev`. Never deploy this setting:
+# it only takes effect for requests to localhost, but keep it out of wrangler.jsonc anyway.
+DEV_ALLOW_UNAUTHENTICATED=true

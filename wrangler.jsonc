@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "php-exposure-scan",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-15",
+  // Set account_id here if your Cloudflare login has more than one account.
+  // The only hostname. Protect it with an Access application; the Worker also
+  // verifies the Access JWT itself. workers.dev stays off so there is no second
+  // hostname to protect.
+  "routes": [{ "pattern": "php-check.example.com", "custom_domain": true }],
+  "workers_dev": false,
+  "preview_urls": false,
+  "observability": { "enabled": true },
+  "limits": {
+    // Worst case is roughly 3 homepage attempts + redirects + 1 login probe per site.
+    // 500 sites x ~20 subrequests stays under this. Paid plans default to 10,000.
+    "subrequests": 20000
+  },
+  "vars": {
+    // Access team domain and the Access application's AUD tag (not secret).
+    // The Worker refuses every request until both are set.
+    "TEAM_DOMAIN": "",
+    "POLICY_AUD": "",
+    "USER_AGENT": "php-exposure-scan/1.0 (security check; +https://example.com/contact)",
+    "MAX_DOMAINS": "500",
+    "CONCURRENCY": "6",
+    "TIMEOUT_MS": "15000"
+  }
+}

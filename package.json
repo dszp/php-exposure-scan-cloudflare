@@ -1,0 +1,30 @@
+{
+  "name": "php-exposure-scan",
+  "version": "1.0.0",
+  "description": "Cloudflare Worker that checks public sites for signs of PHP/WordPress",
+  "directories": {
+    "test": "test"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "vitest run",
+    "typecheck": "tsc",
+    "check": "tsc && vitest run && wrangler deploy --dry-run --outdir .wrangler/dry"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "jose": "^6.2.12"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261013.1",
+    "typescript": "^7.0.2",
+    "vitest": "~5.0.4",
+    "wrangler": "~4.150.0"
+  },
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/dszp/php-exposure-scan-cloudflare.git"
+  }
+}
